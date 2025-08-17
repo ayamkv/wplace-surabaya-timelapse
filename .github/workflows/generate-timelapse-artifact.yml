@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       date:
-        description: 'Дата в формате YYYYMMDD (Томск). Оставьте пустым для вчерашнего дня'
+        description: 'Date in YYYYMMDD (Surabaya UTC+7). Leave empty for yesterday.'
         required: false
         type: string
 
@@ -38,7 +38,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Compute target date (Tomsk)
+      - name: Ensure ffmpeg present
+        run: |
+          ffmpeg -version || sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Compute target date (Surabaya)
         id: dates
         shell: bash
         env:
@@ -48,7 +52,7 @@ jobs:
           from datetime import datetime, timedelta, timezone
           import os
           val = (os.environ.get('REQUESTED_DATE') or '').strip()
-          tomsk = timezone(timedelta(hours=7))
+          tz = timezone(timedelta(hours=7))
           def is_valid(s: str) -> bool:
               if len(s) != 8 or not s.isdigit():
                   return False
@@ -60,7 +64,7 @@ jobs:
           if is_valid(val):
               target = val
           else:
-              y = datetime.now(tomsk) - timedelta(days=1)
+              y = datetime.now(tz) - timedelta(days=1)
               target = y.strftime('%Y%m%d')
           out = f"date={target}\n"
           with open(os.environ['GITHUB_OUTPUT'], 'w', encoding='utf-8') as f:
@@ -84,11 +88,11 @@ jobs:
             echo "Already have cached dumps for ${YDATE}"
           else
             rm -rf tmp_wplace
-            git clone --filter=blob:none --no-checkout https://github.com/niklinque/wplace-tomsk.git tmp_wplace
+            git clone --filter=blob:none --no-checkout https://github.com/ayamkv/wplace-surabaya.git tmp_wplace
             cd tmp_wplace
             git sparse-checkout init --cone
             git sparse-checkout set output/${YDATE}
-            git checkout main
+            git checkout main || git checkout master || true
             cd ..
             mkdir -p output
             if [ -d "tmp_wplace/output/${YDATE}" ]; then
@@ -106,6 +110,10 @@ jobs:
         shell: bash
         env:
           SKIP_LATEST_COPY: "1"
+          CRF: '15'
+          PRESET: 'slow'
+          PIX_FMT: 'yuv444p'
+          EXTRA_FFMPEG: '-tune animation'
         run: |
           set -e
           if [ "${{ steps.dates.outputs.date }}" = "" ]; then

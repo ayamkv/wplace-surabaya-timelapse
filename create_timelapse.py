@@ -1,281 +1,273 @@
 #!/usr/bin/env python3
 """
-Скрипт для создания видео-таймлапса из дампов изображений.
-Собирает все изображения за день и создает видео на белом фоне.
+Surabaya (WIB / UTC+7) pixel-art timelapse generator.
+
+Features:
+- Collect daily merged tile images (merged_tiles_YYYYMMDD_HHMMSS.png)
+- Pixel-art safe: all scaling uses NEAREST (no blur)
+- Centers frames on white background if aspect differs
+- Timestamp overlay (centered near bottom)
+- Encodes via ffmpeg (libx264 by default) instead of OpenCV mp4v
+
+Environment variables:
+  VIDEO_WIDTH / VIDEO_HEIGHT  Force output resolution (integers)
+  DOWNSCALE_FACTOR            Integer divisor applied to detected source size
+  VIDEO_CODEC                 libx264 (default), libx265, ffv1, etc.
+  CRF                         x264/x265 quality (default 15, 0 = lossless)
+  PRESET                      x264/x265 preset (default slow)
+  PIX_FMT                     Pixel format (default yuv444p for crisp chroma)
+  EXTRA_FFMPEG                Extra ffmpeg args (e.g. "-tune animation")
+  KEEP_FRAMES                 Keep intermediate PNG frames if set
+  SKIP_LATEST_COPY            Skip creating timelapse/latest.mp4 copy if set
+
+Logic for target size:
+  1. If VIDEO_WIDTH & VIDEO_HEIGHT provided -> use them
+  2. Else inspect first image; if DOWNSCALE_FACTOR divides both dims -> apply
+  3. Else if width >= 4000 and divisible by 2 -> auto half-size
+  4. Else use original image size
+  5. Fallback defaults 3000x3000
 """
 
 import os
 import glob
 import logging
-import sys
 import argparse
+import tempfile
+import shutil
+import subprocess
 from datetime import datetime, timedelta, timezone
 from PIL import Image, ImageDraw
-import cv2
-import numpy as np
-import requests
 
-# Настройка логирования
+# Logging setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Константы
+# Constants / defaults
 OUTPUT_DIR = "output"
 TIMELAPSE_DIR = "timelapse"
-VIDEO_WIDTH = 3000
-VIDEO_HEIGHT = 3000
+DEFAULT_VIDEO_WIDTH = 3000
+DEFAULT_VIDEO_HEIGHT = 3000
 FPS = 9
-BACKGROUND_COLOR = (255, 255, 255)  # Белый фон
-TOMSK_TZ = timezone(timedelta(hours=7))
+BACKGROUND_COLOR = (255, 255, 255)  # White background
+SURABAYA_TZ = timezone(timedelta(hours=7))  # WIB (UTC+7)
+
+# ---------------- Collect images -----------------
 
 def get_images_for_date(date_str):
-    """
-    Получает список изображений за указанную дату.
-    
-    Args:
-        date_str (str): Дата в формате YYYYMMDD
-        
-    Returns:
-        list: Список путей к файлам изображений
-    """
-    images = []
-    
-    date_folder = os.path.join(OUTPUT_DIR, date_str)
-    if os.path.exists(date_folder):
-        pattern = os.path.join(date_folder, "merged_tiles_*.png")
-        folder_images = glob.glob(pattern)
-        images.extend(folder_images)
-        logger.info(f"В папке {date_str} найдено {len(folder_images)} изображений")
-    
-    # Сортируем по дате и времени из имени файла: merged_tiles_YYYYMMDD_HHMMSS.png
-    def extract_timestamp_key(file_path):
-        filename = os.path.basename(file_path)
-        parts = filename.split('_')
+    """Return sorted list of image paths for given date (YYYYMMDD)."""
+    folder = os.path.join(OUTPUT_DIR, date_str)
+    if not os.path.isdir(folder):
+        logger.warning(f"No folder for date {date_str}: {folder}")
+        return []
+    images = glob.glob(os.path.join(folder, "merged_tiles_*.png"))
+
+    def key(p):
+        fname = os.path.basename(p)
+        parts = fname.split('_')
+        # merged_tiles_YYYYMMDD_HHMMSS.png -> parts[2]=date, parts[3]=time.png
         if len(parts) >= 4:
-            date_part = parts[2]
-            time_part = parts[3].split('.')[0]
-            return f"{date_part}_{time_part}"
-        return filename
-    
-    images.sort(key=extract_timestamp_key)
-    
-    logger.info(f"Всего найдено {len(images)} изображений за {date_str}")
+            d = parts[2]
+            t = parts[3].split('.')[0]
+            return f"{d}_{t}"
+        return fname
+
+    images.sort(key=key)
+    logger.info(f"Found {len(images)} images for {date_str}")
     return images
 
-def resize_image_to_fit(image, target_width, target_height, background_color=(255, 255, 255)):
-    """
-    Изменяет размер изображения с сохранением пропорций и добавляет белый фон.
-    
-    Args:
-        image (PIL.Image): Исходное изображение
-        target_width (int): Целевая ширина
-        target_height (int): Целевая высота
-        background_color (tuple): Цвет фона
-        
-    Returns:
-        tuple: (PIL.Image, (x, y, new_width, new_height)) — изображение и позиция/размер вставленного контента
-    """
-    # Если изображение уже совпадает с целевым размером, не масштабируем
-    img_width, img_height = image.size
-    if img_width == target_width and img_height == target_height:
-        return image, (0, 0, target_width, target_height)
+# ---------------- Pixel-art resizing -----------------
 
-    # Если исходный размер уже совпадает с целевым, возвращаем без пересэмплинга
-    img_width, img_height = image.size
-    if img_width == target_width and img_height == target_height:
-        if image.mode == 'RGBA':
-            composed = Image.new('RGB', (target_width, target_height), background_color)
-            composed.paste(image, (0, 0), image)
-            return composed, (0, 0, target_width, target_height)
-        return image.convert('RGB'), (0, 0, target_width, target_height)
-
-    # Вычисляем коэффициент масштабирования для сохранения пропорций
-    scale_w = target_width / img_width
-    scale_h = target_height / img_height
-    scale = min(scale_w, scale_h)
-    
-    # Новые размеры с сохранением пропорций
-    new_width = int(img_width * scale)
-    new_height = int(img_height * scale)
-
-    # Выбираем метод ресайза: для кратного масштабирования используем NEAREST (пиксель-перфект)
-    down_int = (img_width % target_width == 0) and (img_height % target_height == 0)
-    up_int = (target_width % img_width == 0) and (target_height % img_height == 0)
-    resample = Image.NEAREST if (down_int or up_int) else Image.Resampling.LANCZOS
-    
-    # Изменяем размер изображения
-    resized_image = image.resize((new_width, new_height), resample)
-    
-    # Создаем новое изображение с белым фоном
-    result = Image.new('RGB', (target_width, target_height), background_color)
-    
-    # Вычисляем позицию для центрирования
-    x = (target_width - new_width) // 2
-    y = (target_height - new_height) // 2
-    
-    # Вставляем изображение по центру
-    if resized_image.mode == 'RGBA':
-        result.paste(resized_image, (x, y), resized_image)
+def resize_image_to_fit(image, target_width, target_height, background_color=BACKGROUND_COLOR):
+    """Resize preserving aspect ratio with NEAREST and letterbox on white.
+    Returns (image_rgb, (x,y,new_w,new_h))."""
+    w, h = image.size
+    if (w, h) == (target_width, target_height):
+        return (image.convert('RGB') if image.mode != 'RGB' else image), (0, 0, w, h)
+    scale = min(target_width / w, target_height / h)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+    resized = image.resize((new_w, new_h), Image.NEAREST)
+    canvas = Image.new('RGB', (target_width, target_height), background_color)
+    x = (target_width - new_w) // 2
+    y = (target_height - new_h) // 2
+    if resized.mode == 'RGBA':
+        canvas.paste(resized, (x, y), resized)
     else:
-        result.paste(resized_image, (x, y))
-    
-    return result, (x, y, new_width, new_height)
+        canvas.paste(resized, (x, y))
+    return canvas, (x, y, new_w, new_h)
 
-def add_timestamp_overlay(image, timestamp, font_size=36):
-    """
-    Добавляет временную метку на изображение.
-    
-    Args:
-        image (PIL.Image): Изображение
-        timestamp (str): Временная метка
-        font_size (int): Размер шрифта
-        
-    Returns:
-        PIL.Image: Изображение с временной меткой
-    """
-    # Подготовим RGBA для полупрозрачности
+# ---------------- Timestamp overlay -----------------
+
+def add_timestamp_overlay(image, timestamp):
     base = image.convert('RGBA')
     overlay = Image.new('RGBA', base.size, (255, 255, 255, 0))
     draw = ImageDraw.Draw(overlay)
-
-    # Вычислим размер текста и позицию по центру снизу
-    # Начальная позиция для bbox (0,0), затем отцентрируем вручную
-    text_bbox = draw.textbbox((0, 0), timestamp)
-    text_width = text_bbox[2] - text_bbox[0]
-    text_height = text_bbox[3] - text_bbox[1]
-    margin_x = 16
-    margin_y = 12
-    x = (image.width - text_width) // 2
-    y = image.height - text_height - margin_y - 8
-
-    # Полупрозрачный (слегка) текст со stroke для читаемости
+    bbox = draw.textbbox((0, 0), timestamp)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    y = image.height - th - 20
+    x = (image.width - tw) // 2
     draw.text((x, y), timestamp, fill=(255, 255, 255, 230), stroke_width=2, stroke_fill=(0, 0, 0, 160))
+    return Image.alpha_composite(base, overlay).convert('RGB')
 
-    # Композитим и возвращаем в RGB
-    composed = Image.alpha_composite(base, overlay).convert('RGB')
-    return composed
+# ---------------- Size determination -----------------
 
-def create_timelapse_video(images, output_path):
-    """
-    Создает видео-таймлапс из списка изображений.
-    
-    Args:
-        images (list): Список путей к изображениям
-        output_path (str): Путь для сохранения видео
-        
-    Returns:
-        bool: True если успешно, False в случае ошибки
-    """
-    if not images:
-        logger.error("Нет изображений для создания таймлапса")
-        return False
-    
+def determine_video_size(images):
+    env_w = os.getenv('VIDEO_WIDTH')
+    env_h = os.getenv('VIDEO_HEIGHT')
+    if env_w and env_h:
+        try:
+            w = int(env_w); h = int(env_h)
+            logger.info(f"Using forced video size {w}x{h}")
+            return w, h
+        except ValueError:
+            logger.warning("Invalid VIDEO_WIDTH/VIDEO_HEIGHT; ignoring.")
+    if images:
+        try:
+            with Image.open(images[0]) as im0:
+                sw, sh = im0.size
+            ds = os.getenv('DOWNSCALE_FACTOR')
+            if ds:
+                try:
+                    f = int(ds)
+                    if f > 1 and sw % f == 0 and sh % f == 0:
+                        logger.info(f"Downscale factor {f}: {sw}x{sh} -> {sw//f}x{sh//f}")
+                        return sw // f, sh // f
+                    else:
+                        logger.warning("DOWNSCALE_FACTOR invalid (not divisor).")
+                except ValueError:
+                    logger.warning("Invalid DOWNSCALE_FACTOR; ignoring.")
+            if sw >= 4000 and sw % 2 == 0 and sh % 2 == 0:
+                logger.info(f"Auto half-size {sw}x{sh} -> {sw//2}x{sh//2}")
+                return sw // 2, sh // 2
+            logger.info(f"Using original size {sw}x{sh}")
+            return sw, sh
+        except Exception as e:
+            logger.warning(f"Size inspect failed: {e}")
+    logger.info(f"Fallback default {DEFAULT_VIDEO_WIDTH}x{DEFAULT_VIDEO_HEIGHT}")
+    return DEFAULT_VIDEO_WIDTH, DEFAULT_VIDEO_HEIGHT
+
+# ---------------- Timestamp parsing -----------------
+
+def build_timestamp(filename, index):
+    parts = filename.split('_')
+    if len(parts) >= 4:
+        d = parts[2]
+        t = parts[3].split('.')[0]
+        if len(d) == 8 and len(t) == 6:
+            return f"{d[:4]}-{d[4:6]}-{d[6:8]} {t[:2]}:{t[2:4]}:{t[4:6]}"
+    return f"Frame {index+1}"
+
+# ---------------- ffmpeg encoding -----------------
+
+def encode_with_ffmpeg(frame_dir, pattern, out_path):
+    codec = os.getenv('VIDEO_CODEC', 'libx264')
+    crf = os.getenv('CRF', '15')
+    preset = os.getenv('PRESET', 'slow')
+    pix_fmt = os.getenv('PIX_FMT', 'yuv444p')
+    extra = os.getenv('EXTRA_FFMPEG', '')
+    extra_args = extra.split() if extra else []
+
+    cmd = [
+        'ffmpeg', '-y',
+        '-framerate', str(FPS),
+        '-f', 'image2',
+        '-i', os.path.join(frame_dir, pattern),
+        '-c:v', codec,
+        '-preset', preset,
+        '-crf', crf,
+        '-pix_fmt', pix_fmt,
+        *extra_args,
+        '-movflags', '+faststart',
+        out_path
+    ]
+
+    logger.info('Running ffmpeg: ' + ' '.join(cmd))
     try:
-        # Инициализируем видео writer
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        video_writer = cv2.VideoWriter(output_path, fourcc, FPS, (VIDEO_WIDTH, VIDEO_HEIGHT))
-        
-        logger.info(f"Создаю видео с {len(images)} кадрами, FPS: {FPS}")
-        
-        for i, image_path in enumerate(images):
-            try:
-                # Загружаем изображение
-                pil_image = Image.open(image_path)
-                
-                # Извлекаем временную метку из имени файла
-                filename = os.path.basename(image_path)
-                # Формат: merged_tiles_YYYYMMDD_HHMMSS.png
-                parts = filename.split('_')
-                if len(parts) >= 3:
-                    date_part = parts[2]
-                    time_part = parts[3].split('.')[0]
-                    timestamp = f"{date_part[:4]}-{date_part[4:6]}-{date_part[6:8]} {time_part[:2]}:{time_part[2:4]}:{time_part[4:6]}"
-                else:
-                    timestamp = f"Кадр {i+1}"
-                
-                # Изменяем размер и добавляем на белый фон
-                resized_image, placement = resize_image_to_fit(pil_image, VIDEO_WIDTH, VIDEO_HEIGHT, BACKGROUND_COLOR)
-                
-                # Добавляем временную метку
-                final_image = add_timestamp_overlay(resized_image, timestamp)
-                
-                # Конвертируем PIL в OpenCV формат
-                opencv_image = cv2.cvtColor(np.array(final_image), cv2.COLOR_RGB2BGR)
-                
-                # Записываем кадр в видео
-                video_writer.write(opencv_image)
-                
-                if (i + 1) % 10 == 0:
-                    logger.info(f"Обработано {i + 1}/{len(images)} кадров")
-                    
-            except Exception as e:
-                logger.error(f"Ошибка при обработке изображения {image_path}: {e}")
-                continue
-        
-        # Закрываем video writer
-        video_writer.release()
-        logger.info(f"Видео успешно создано: {output_path}")
+        proc = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        logger.info('ffmpeg encode complete')
         return True
-        
-    except Exception as e:
-        logger.error(f"Ошибка при создании видео: {e}")
+    except FileNotFoundError:
+        logger.error('ffmpeg not found in PATH')
+    except subprocess.CalledProcessError as e:
+        logger.error(f'ffmpeg failed code={e.returncode}')
+        stderr_tail = e.stderr.decode(errors='ignore')[-4000:]
+        logger.error(stderr_tail)
+    return False
+
+# ---------------- Timelapse creation -----------------
+
+def create_timelapse_video(images, output_path, video_width, video_height):
+    if not images:
+        logger.error('No images to create timelapse')
         return False
+
+    temp_dir = tempfile.mkdtemp(prefix='frames_')
+    logger.info(f'Generating frames in {temp_dir}')
+
+    for i, path in enumerate(images):
+        try:
+            with Image.open(path) as im:
+                ts = build_timestamp(os.path.basename(path), i)
+                fitted, _ = resize_image_to_fit(im, video_width, video_height, BACKGROUND_COLOR)
+                final = add_timestamp_overlay(fitted, ts)
+                final.save(os.path.join(temp_dir, f'frame_{i:05d}.png'), 'PNG')
+            if (i + 1) % 20 == 0:
+                logger.info(f'{i+1}/{len(images)} frames prepared')
+        except Exception as e:
+            logger.error(f'Frame {path} failed: {e}')
+
+    ok = encode_with_ffmpeg(temp_dir, 'frame_%05d.png', output_path)
+    if ok:
+        if os.getenv('KEEP_FRAMES'):
+            logger.info(f'Frames kept at {temp_dir}')
+        else:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    else:
+        logger.warning(f'Keeping frames for debugging: {temp_dir}')
+    return ok
+
+# ---------------- CLI -----------------
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Создание видео-таймлапса из изображений за день")
-    parser.add_argument("--date", dest="date_str", help="Дата в формате YYYYMMDD. По умолчанию — вчера (Томск)")
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description='Create Surabaya pixel-art timelapse (ffmpeg/x264).')
+    p.add_argument('--date', dest='date_str', help='Date YYYYMMDD (default: yesterday UTC+7)')
+    return p.parse_args()
+
+# ---------------- Main -----------------
 
 def main():
-    """
-    Основная функция скрипта.
-    """
-    # Создаем директорию для таймлапсов
     os.makedirs(TIMELAPSE_DIR, exist_ok=True)
-    
     args = parse_args()
     if args.date_str:
         date_str = args.date_str
     else:
-        # Получаем вчерашнюю дату (так как скрипт обычно запускается на следующий день)
-        yesterday = datetime.now(TOMSK_TZ) - timedelta(days=1)
-        date_str = yesterday.strftime("%Y%m%d")
-    
-    logger.info(f"Создаю таймлапс за {date_str}")
-    
-    # Получаем список изображений за день
+        date_str = (datetime.now(SURABAYA_TZ) - timedelta(days=1)).strftime('%Y%m%d')
+
+    logger.info(f'Creating timelapse for {date_str}')
     images = get_images_for_date(date_str)
-    
     if not images:
-        logger.warning(f"Не найдено изображений за {date_str}")
-        return False
-    
-    # Создаем имя выходного файла
-    output_filename = f"timelapse_{date_str}.mp4"
-    output_path = os.path.join(TIMELAPSE_DIR, output_filename)
-    
-    # Создаем таймлапс
-    success = create_timelapse_video(images, output_path)
-    
-    if success:
-        logger.info(f"Таймлапс успешно создан: {output_path}")
-        
-        # Также создаем ссылку на последний таймлапс (если не отключено)
-        if not os.getenv('SKIP_LATEST_COPY'):
-            latest_path = os.path.join(TIMELAPSE_DIR, "latest.mp4")
-        if os.path.exists(latest_path):
-            os.remove(latest_path)
-        
-        # Создаем копию как latest.mp4
-        import shutil
-        shutil.copy2(output_path, latest_path)
-        logger.info(f"Создана копия как: {latest_path}")
-        
-        return True
-    else:
-        logger.error("Не удалось создать таймлапс")
+        logger.warning(f'No images found for {date_str}')
         return False
 
-if __name__ == "__main__":
-    success = main()
-    exit(0 if success else 1)
+    vid_w, vid_h = determine_video_size(images)
+    output_path = os.path.join(TIMELAPSE_DIR, f'timelapse_{date_str}.mp4')
+
+    if create_timelapse_video(images, output_path, vid_w, vid_h):
+        logger.info(f'Timelapse created: {output_path}')
+        if not os.getenv('SKIP_LATEST_COPY'):
+            latest = os.path.join(TIMELAPSE_DIR, 'latest.mp4')
+            try:
+                if os.path.exists(latest):
+                    os.remove(latest)
+                shutil.copy2(output_path, latest)
+                logger.info('Updated latest.mp4')
+            except Exception as e:
+                logger.warning(f'Failed to update latest.mp4: {e}')
+        return True
+    logger.error('Failed to create timelapse')
+    return False
+
+if __name__ == '__main__':
+    import sys
+    sys.exit(0 if main() else 1)
