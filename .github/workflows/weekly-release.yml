@@ -16,6 +16,7 @@ jobs:
       PRESET: 'slow'
       PIX_FMT: 'yuv420p'
       DOWNSCALE_FACTOR: '2'
+      SOURCE_REPO: 'ayamkv/wplace-surabaya'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -44,8 +45,34 @@ jobs:
           # Build timelapse for each of the previous 7 days (1=Yesterday .. 7 days ago) using UTC+7 offset
           for i in $(seq 1 7); do
             DATE=$(date -u -d "$i day ago +7 hours" +%Y%m%d)
-            echo "Building $DATE"
-            python create_timelapse.py --date "$DATE" || true
+            echo "=== Processing $DATE ==="
+            if [ ! -d "output/$DATE" ]; then
+              echo "Fetching output/$DATE from ${SOURCE_REPO}"
+              rm -rf tmp_src
+              git clone --filter=blob:none --no-checkout https://github.com/${SOURCE_REPO}.git tmp_src
+              cd tmp_src
+              git sparse-checkout init --cone
+              git sparse-checkout set output/$DATE || true
+              git checkout main || git checkout master || true
+              cd ..
+              if [ -d "tmp_src/output/$DATE" ]; then
+                mkdir -p output
+                rm -rf "output/$DATE"
+                cp -r "tmp_src/output/$DATE" "output/$DATE"
+                echo "Fetched $DATE"
+              else
+                echo "No data for $DATE in source repo"
+              fi
+              rm -rf tmp_src
+            else
+              echo "Already have output/$DATE"
+            fi
+            if [ -d "output/$DATE" ]; then
+              echo "Building timelapse for $DATE"
+              python create_timelapse.py --date "$DATE" || true
+            else
+              echo "Skipping timelapse build for $DATE (no images)"
+            fi
           done
           # Gather up to 7 most recent daily mp4s (could be fewer if missing days)
           ls timelapse/timelapse_*.mp4 2>/dev/null | sort | tail -n 7 > weekly_files.txt || true
