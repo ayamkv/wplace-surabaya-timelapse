@@ -47,24 +47,41 @@ jobs:
             echo "Building $DATE"
             python create_timelapse.py --date "$DATE" || true
           done
-          # Collect last 7 mp4s (sorted)
-            ls timelapse/timelapse_*.mp4 2>/dev/null | sort | tail -n 7 > weekly_files.txt || true
-          if [ ! -s weekly_files.txt ]; then
-            echo "No timelapse files"; exit 0; fi
+          # Gather up to 7 most recent daily mp4s (could be fewer if missing days)
+          ls timelapse/timelapse_*.mp4 2>/dev/null | sort | tail -n 7 > weekly_files.txt || true
+          COUNT=$(wc -l < weekly_files.txt || echo 0)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No timelapse files present; skipping release.";
+            echo "made=0" >> $GITHUB_OUTPUT;
+            exit 0;
+          fi
           > list.txt
           while read -r F; do echo "file '$F'" >> list.txt; done < weekly_files.txt
+          echo "Combining $COUNT day(s)."
           if [ -s list.txt ]; then
             ffmpeg -y -f concat -safe 0 -i list.txt -c copy timelapse/weekly_concat.mp4 \
               || ffmpeg -y -f concat -safe 0 -i list.txt -c:v libx264 -crf ${CRF} -preset ${PRESET} -pix_fmt ${PIX_FMT} timelapse/weekly_concat.mp4
           fi
-          if [ -f timelapse/weekly_concat.mp4 ]; then echo "made=1" >> $GITHUB_OUTPUT; else echo "made=0" >> $GITHUB_OUTPUT; fi
+          if [ -f timelapse/weekly_concat.mp4 ]; then
+            echo "made=1" >> $GITHUB_OUTPUT
+            echo "count=$COUNT" >> $GITHUB_OUTPUT
+            if [ "$COUNT" -eq 7 ]; then
+              echo "tag=weekly-${GITHUB_RUN_NUMBER}" >> $GITHUB_OUTPUT
+              echo "rname=Weekly Timelapse (Run ${GITHUB_RUN_NUMBER})" >> $GITHUB_OUTPUT
+            else
+              echo "tag=partial-${COUNT}-of-7-${GITHUB_RUN_NUMBER}" >> $GITHUB_OUTPUT
+              echo "rname=Partial Timelapse (${COUNT}/7 days, Run ${GITHUB_RUN_NUMBER})" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "made=0" >> $GITHUB_OUTPUT
+          fi
 
-      - name: Create weekly release
+      - name: Create weekly/partial release
         if: steps.gen.outputs.made == '1'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: weekly-${{ github.run_number }}
-          name: Weekly Timelapse (Run ${{ github.run_number }})
+          tag_name: ${{ steps.gen.outputs.tag }}
+          name: ${{ steps.gen.outputs.rname }}
           files: |
             timelapse/weekly_concat.mp4
         env:
