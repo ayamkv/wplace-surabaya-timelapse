@@ -5,9 +5,9 @@ Surabaya (WIB / UTC+7) pixel-art timelapse generator.
 Features:
 - Collect daily merged tile images (merged_tiles_YYYYMMDD_HHMMSS.png)
 - Pixel-art safe: all scaling uses NEAREST (no blur)
-- Centers frames on white background if aspect differs
+- Optional static map background instead of solid white
 - Timestamp overlay (centered near bottom)
-- Encodes via ffmpeg (libx264 by default) instead of OpenCV mp4v
+- Encodes via ffmpeg (libx264 by default)
 
 Environment variables:
   VIDEO_WIDTH / VIDEO_HEIGHT  Force output resolution (integers)
@@ -19,13 +19,8 @@ Environment variables:
   EXTRA_FFMPEG                Extra ffmpeg args (e.g. "-tune animation")
   KEEP_FRAMES                 Keep intermediate PNG frames if set
   SKIP_LATEST_COPY            Skip creating timelapse/latest.mp4 copy if set
-
-Logic for target size:
-  1. If VIDEO_WIDTH & VIDEO_HEIGHT provided -> use them
-  2. Else inspect first image; if DOWNSCALE_FACTOR divides both dims -> apply
-  3. Else if width >= 4000 and divisible by 2 -> auto half-size
-  4. Else use original image size
-  5. Fallback defaults 3000x3000
+  STATIC_MAP_PATH             Path to static map image (default static/static_map.png)
+  MAP_BACKGROUND              If "0" disables static map background
 """
 
 import os
@@ -48,8 +43,42 @@ TIMELAPSE_DIR = "timelapse"
 DEFAULT_VIDEO_WIDTH = 3000
 DEFAULT_VIDEO_HEIGHT = 3000
 FPS = 9
-BACKGROUND_COLOR = (255, 255, 255)  # White background
+BACKGROUND_COLOR = (255, 255, 255)  # Fallback solid background
 SURABAYA_TZ = timezone(timedelta(hours=7))  # WIB (UTC+7)
+STATIC_MAP_PATH = os.getenv("STATIC_MAP_PATH", os.path.join("static", "static_map.png"))
+USE_MAP = os.getenv("MAP_BACKGROUND", "1") != "0"
+
+# Cached background (w,h,img)
+_BG_CACHE = None
+
+def load_and_prepare_background(target_w: int, target_h: int) -> Image.Image:
+    """Return an RGB background sized to (target_w,target_h).
+    Uses static map (cover + crop, NEAREST) if available & enabled; otherwise solid color."""
+    global _BG_CACHE
+    if USE_MAP:
+        if _BG_CACHE and _BG_CACHE[0] == target_w and _BG_CACHE[1] == target_h:
+            return _BG_CACHE[2]
+        try:
+            if os.path.isfile(STATIC_MAP_PATH):
+                with Image.open(STATIC_MAP_PATH) as m:
+                    mw, mh = m.size
+                    # Cover scaling so map fills frame
+                    scale = max(target_w / mw, target_h / mh)
+                    new_w = int(mw * scale)
+                    new_h = int(mh * scale)
+                    resized = m.resize((new_w, new_h), Image.NEAREST)
+                    x0 = (new_w - target_w) // 2
+                    y0 = (new_h - target_h) // 2
+                    cropped = resized.crop((x0, y0, x0 + target_w, y0 + target_h))
+                    bg = cropped.convert('RGB')
+                    _BG_CACHE = (target_w, target_h, bg)
+                    return bg
+            else:
+                logger.debug(f"Static map path not found: {STATIC_MAP_PATH}")
+        except Exception as e:
+            logger.warning(f"Static map load failed, fallback solid: {e}")
+    # Solid fallback
+    return Image.new('RGB', (target_w, target_h), BACKGROUND_COLOR)
 
 # ---------------- Collect images -----------------
 
@@ -77,23 +106,25 @@ def get_images_for_date(date_str):
 
 # ---------------- Pixel-art resizing -----------------
 
-def resize_image_to_fit(image, target_width, target_height, background_color=BACKGROUND_COLOR):
-    """Resize preserving aspect ratio with NEAREST and letterbox on white.
-    Returns (image_rgb, (x,y,new_w,new_h))."""
+def resize_image_to_fit(image, target_width, target_height):
+    """Resize preserving aspect ratio with NEAREST.
+    Returns an RGBA canvas (transparent) containing the centered resized image and placement tuple."""
     w, h = image.size
     if (w, h) == (target_width, target_height):
-        return (image.convert('RGB') if image.mode != 'RGB' else image), (0, 0, w, h)
+        base = Image.new('RGBA', (target_width, target_height), (0, 0, 0, 0))
+        img_rgba = image.convert('RGBA') if image.mode != 'RGBA' else image
+        base.paste(img_rgba, (0, 0), img_rgba)
+        return base, (0, 0, w, h)
     scale = min(target_width / w, target_height / h)
     new_w = int(w * scale)
     new_h = int(h * scale)
     resized = image.resize((new_w, new_h), Image.NEAREST)
-    canvas = Image.new('RGB', (target_width, target_height), background_color)
+    if resized.mode != 'RGBA':
+        resized = resized.convert('RGBA')
+    canvas = Image.new('RGBA', (target_width, target_height), (0, 0, 0, 0))
     x = (target_width - new_w) // 2
     y = (target_height - new_h) // 2
-    if resized.mode == 'RGBA':
-        canvas.paste(resized, (x, y), resized)
-    else:
-        canvas.paste(resized, (x, y))
+    canvas.paste(resized, (x, y), resized)
     return canvas, (x, y, new_w, new_h)
 
 # ---------------- Timestamp overlay -----------------
@@ -205,13 +236,18 @@ def create_timelapse_video(images, output_path, video_width, video_height):
     temp_dir = tempfile.mkdtemp(prefix='frames_')
     logger.info(f'Generating frames in {temp_dir}')
 
+    bg = load_and_prepare_background(video_width, video_height)
+
     for i, path in enumerate(images):
         try:
             with Image.open(path) as im:
                 ts = build_timestamp(os.path.basename(path), i)
-                fitted, _ = resize_image_to_fit(im, video_width, video_height, BACKGROUND_COLOR)
-                final = add_timestamp_overlay(fitted, ts)
-                final.save(os.path.join(temp_dir, f'frame_{i:05d}.png'), 'PNG')
+                fitted_rgba, _ = resize_image_to_fit(im, video_width, video_height)
+                # Composite over background
+                frame_rgba = bg.convert('RGBA')
+                frame_rgba.alpha_composite(fitted_rgba)
+                final = add_timestamp_overlay(frame_rgba.convert('RGB'), ts)
+                final.save(os.path.join(temp_dir, f'frame_{i:05d}.png'), 'PNG', optimize=False)
             if (i + 1) % 20 == 0:
                 logger.info(f'{i+1}/{len(images)} frames prepared')
         except Exception as e:
