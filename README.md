@@ -1,7 +1,7 @@
 # Surabaya Timelapses (Wplace)
 
 Daily pixel‑art timelapse videos from merged Surabaya tile dumps.  
-Results saved in `timelapse/`.
+Results saved in [Releases](https://github.com/ayamkv/wplace-surabaya-timelapse/releases).
 
 ## What Happens
 1. Another script (different repo) saves images like:
@@ -11,9 +11,9 @@ Results saved in `timelapse/`.
    - Sorts that day’s images
    - Resizes with NEAREST (no blur), adds timestamp
    - Uses `ffmpeg` (H.264) to make `timelapse/timelapse_YYYYMMDD.mp4`
-   - Copies it to `timelapse/latest.mp4` (just the newest day)
+  - ~~Copies it to `timelapse/latest.mp4` (just the newest day)~~
 
-`latest.mp4` is ONLY that last day, not all days combined.
+~~`latest.mp4` is ONLY that last day, not all days combined.~~
 
 ## Simple Terms (Environment Settings)
 | Variable | Plain meaning | Typical value |
@@ -33,7 +33,7 @@ Auto size logic (if you don’t force it):
 2. Else keeps original
 3. Else fallback 3000×3000
 
-## Stay Under GitHub Actions Limits
+## Staying Under GitHub Actions Limits
 Goal: keep each daily video reasonably small (< ~50–80 MB) so:
 - Fast to upload as artifact
 - Doesn’t eat bandwidth
@@ -42,12 +42,10 @@ How:
 - Use `CRF=18` (sharp) or `CRF=20` (smaller)
 - Use `PIX_FMT=yuv420p` if size matters more than perfect color edges
 
-Artifacts (recommended):
+Artifacts:
 - Each workflow run can upload the MP4 as an artifact (auto cleanup after retention period—GitHub default up to 90 days).
-- Keep only `latest.mp4` (or nothing) committed to git so the repo stays small.
-
-Avoid committing every day’s MP4 forever (repo bloat).  
-Git LFS: not great for daily growing history unless you pay.  
+- ~~Keep only `latest.mp4`~~ (or nothing) committed to git so the repo stays small.
+ 
 Releases: use only for “bundle” (e.g. weekly or monthly stitched video).
 
 ## Run Locally
@@ -105,11 +103,5 @@ ffmpeg -f concat -safe 0 -i list.txt -c:v libx264 -crf 18 -preset slow -pix_fmt 
 Q: Does it make one video per day automatically?  
 A: Yes (yesterday’s) when the daily workflow runs.
 
-Q: Is `latest.mp4` all days combined?  
-A: No. Just the most recent single day.
-
 Q: How do I get an “all time” video?  
-A: Concatenate daily MP4s (if identical settings) or re-encode them together.
-
-Q: What should I commit?  
-A: Prefer only `latest.mp4` (or nothing). Use artifacts for the rest.
+A: Check the Releases page
